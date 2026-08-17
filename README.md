@@ -1,8 +1,8 @@
-# 🛡️ AgebypassX v2.3.0
+# 🛡️ AgebypassX v2.4.0
 
 A lightweight Tampermonkey userscript designed to modify X/Twitter's client-side age and sensitive-media feature state directly in the browser.
 
-AgebypassX v2.3.0 uses a **multi-layer state interception system** covering:
+AgebypassX v2.4.0 uses a **multi-layer state interception system** covering:
 
 - `window.__INITIAL_STATE__`
 - `Object.assign`
@@ -11,7 +11,7 @@ AgebypassX v2.3.0 uses a **multi-layer state interception system** covering:
 
 The script runs entirely inside your browser. It does not send data to external servers, include analytics or tracking, or directly modify your X/Twitter account.
 
-> **Note:** v2.3.0 no longer relies primarily on webpack chunk interception. The current implementation works by intercepting and patching application state and parsed response data before X's frontend consumes it.
+> **Note:** Current versions do **not** use webpack chunk interception. Modern AgebypassX releases work by intercepting and patching application state and parsed response data before X's frontend consumes it.
 
 ---
 
@@ -22,9 +22,15 @@ The script runs entirely inside your browser. It does not send data to external 
 1. Install **Tampermonkey** or another compatible userscript manager.
 2. Install the **AgebypassX** userscript.
 3. Open or reload **X/Twitter**.
-4. A small **green status dot** should appear in the upper-right corner when the script has loaded successfully.
+4. A small **green status dot** should appear in the upper-right corner.
 
-The script runs at `document-start` so its hooks are installed as early as possible.
+The script runs at:
+
+```text
+document-start
+```
+
+so its hooks are installed as early as possible.
 
 ---
 
@@ -40,7 +46,7 @@ The script:
 - Does **not** contain advertisements.
 - Does **not** contain telemetry or tracking.
 - Does **not** directly modify your X/Twitter account.
-- Does **not** modify your authentication cookies.
+- Does **not** modify authentication cookies.
 - Stores only the indicator visibility preference locally using `localStorage`.
 
 Everything happens inside the browser through the userscript.
@@ -57,7 +63,7 @@ AgebypassX hooks those paths and patches selected client-side values before the 
 
 ### Targeted Feature Flags
 
-The current version watches for the following flags:
+The current version watches for:
 
 ```js
 rweb_age_assurance_flow_enabled
@@ -68,24 +74,149 @@ grok_settings_age_restriction_enabled
 rweb_mvr_blurred_media_interstitial_enabled
 ```
 
-It also detects compatible feature structures such as:
+The current desired values are:
 
 ```js
 {
-    feature: "feature_name",
+    rweb_age_assurance_flow_enabled: false,
+    age_verification_gate_enabled: false,
+    sensitive_tweet_warnings_enabled: false,
+    sensitive_media_settings_enabled: true,
+    grok_settings_age_restriction_enabled: false,
+    rweb_mvr_blurred_media_interstitial_enabled: false
+}
+```
+
+AgebypassX supports multiple feature-state shapes.
+
+Direct properties:
+
+```js
+{
+    sensitive_media_settings_enabled: true
+}
+```
+
+Wrapped values:
+
+```js
+{
+    sensitive_media_settings_enabled: {
+        value: true
+    }
+}
+```
+
+GraphQL-style feature entries:
+
+```js
+{
+    feature: "sensitive_media_settings_enabled",
     enabled: true
 }
 ```
 
-and feature objects containing:
+The patcher recursively searches relevant state objects while using a per-patch `WeakSet` to protect against circular references.
+
+---
+
+## 🔢 Type-Preserving Feature Writes
+
+X may represent feature-switch values using different types.
+
+For example, a value may appear as:
+
+```js
+true
+```
+
+or:
+
+```js
+"true"
+```
+
+or occasionally:
+
+```js
+1
+```
+
+AgebypassX v2.4.0 preserves the original representation when applying the desired boolean state.
+
+Examples:
+
+```text
+boolean → boolean
+string  → "true" / "false"
+number  → 1 / 0
+```
+
+This avoids breaking frontend code which performs strict comparisons against the original value type.
+
+---
+
+## ✅ Verified Writes
+
+v2.4.0 no longer assumes that assigning a value means the write succeeded.
+
+Target-feature modifications use a verified write process:
+
+```text
+Read current value
+        ↓
+Determine correctly typed desired value
+        ↓
+Attempt assignment
+        ↓
+Read value back
+        ↓
+Verify that the new value actually stuck
+```
+
+This catches cases such as:
+
+- Frozen objects.
+- Non-writable properties.
+- Throwing setters.
+- Setters which accept a value but silently discard it.
+- Unexpected application-state behaviour.
+
+Successful writes are recorded separately from failed writes in the diagnostics.
+
+---
+
+## 🎂 Birthdate Handling
+
+AgebypassX also patches compatible client-side `birthdate` objects to an adult date:
 
 ```js
 {
-    value: true
+    year: 1990,
+    month: 1,
+    day: 1
 }
 ```
 
-The patcher recursively searches relevant state objects while using cycle protection to avoid repeatedly traversing the same object during a single patch operation.
+Birthdate writes are:
+
+- Type-preserving.
+- Verified after assignment.
+- Independently counted in diagnostics.
+
+Existing numeric values remain numbers:
+
+```text
+1995 → 1990
+```
+
+Existing string values remain strings:
+
+```text
+"1995" → "1990"
+```
+
+Missing birthdate fields are filled using numeric values.
 
 ---
 
@@ -93,21 +224,43 @@ The patcher recursively searches relevant state objects while using cycle protec
 
 ### 1. `__INITIAL_STATE__`
 
-AgebypassX installs a setter on:
+AgebypassX installs an accessor on:
 
 ```js
 window.__INITIAL_STATE__
 ```
 
-When X assigns its initial application state, the object is patched before being returned to the application.
+When X assigns its initial application state, the object is patched before the frontend consumes it.
 
-This allows relevant feature configuration to be modified very early during page initialization.
+### Late-Injection Protection
+
+Although the script runs at `document-start`, userscript injection timing can occasionally vary.
+
+v2.4.0 therefore checks whether:
+
+```js
+window.__INITIAL_STATE__
+```
+
+already exists before installing the hook.
+
+If an existing state object is found:
+
+1. Its current value is preserved.
+2. The existing object is patched.
+3. The accessor is installed using that preserved value.
+
+This avoids replacing already-populated application state with `undefined`.
+
+If reading an existing `__INITIAL_STATE__` property itself throws, AgebypassX **does not replace it**.
+
+Instead, Hook 1 is left untouched and the remaining interception layers continue operating.
 
 ---
 
 ### 2. `Object.assign`
 
-Some state is created or updated dynamically after the initial page load.
+Some application state is created or updated dynamically after initial page load.
 
 AgebypassX wraps:
 
@@ -115,21 +268,21 @@ AgebypassX wraps:
 Object.assign
 ```
 
-and checks state-like objects containing structures such as:
+and checks state-like targets containing structures such as:
 
-```js
+```text
 featureSwitch
 entities
 users
 ```
 
-Relevant objects are patched after the assignment completes.
+Relevant objects are patched after the native assignment completes.
 
 ---
 
 ### 3. `JSON.parse`
 
-Some application state is created by parsing JSON strings.
+Some application state is created from JSON strings.
 
 AgebypassX wraps:
 
@@ -137,17 +290,21 @@ AgebypassX wraps:
 JSON.parse
 ```
 
-Before performing a recursive patch, the raw JSON string is checked using a single regular-expression gate.
+Before recursively walking the parsed object, the original JSON text is checked using a single regular-expression gate.
 
-Deep traversal only occurs when the payload contains one of the target feature names or related state fields.
+The gate looks for:
 
-This significantly reduces unnecessary processing.
+- Known target feature names.
+- `birthdate`
+- `featureSwitch`
+
+If nothing relevant is present, the object is returned without a deep traversal.
 
 ---
 
 ### 4. `Response.prototype.json`
 
-Modern applications frequently use:
+Modern X code frequently uses:
 
 ```js
 fetch(...)
@@ -159,48 +316,53 @@ followed by:
 response.json()
 ```
 
-Browser-native `Response.json()` parsing does not necessarily pass through the page's overridden `JSON.parse`.
+Browser-native `Response.json()` parsing can bypass an overridden page-level `JSON.parse`.
 
-For this reason, AgebypassX also wraps:
+AgebypassX therefore also wraps:
 
 ```js
 Response.prototype.json
 ```
 
-Returned objects are first inspected using a lightweight, depth-limited structural scan.
+Returned objects are inspected using a lightweight structural scan before the full patcher runs.
 
-Only potentially relevant responses are passed to the full patcher.
+The current structural pre-scan depth is:
+
+```text
+5
+```
+
+A full recursive patch only occurs when potentially relevant state is detected.
 
 ---
 
 ## ⚡ Performance
 
-AgebypassX is designed to avoid blindly scanning every object X creates.
+AgebypassX is designed to avoid blindly scanning everything X creates.
 
 ### Raw JSON Gate
 
-Before recursively walking data parsed through `JSON.parse`, the script performs a single regex search for:
+Before recursively walking data returned through `JSON.parse`, the script performs a single regex search for:
 
-- Target feature flag names
+- Target feature names.
 - `birthdate`
 - `featureSwitch`
 
-If none of those values are present, the parsed object is returned immediately without a deep scan.
+If none are present, no recursive patch is performed.
 
 ### Fetch Response Gate
 
-Objects returned from `Response.json()` use a depth-limited key search before the full patcher is invoked.
-
-This avoids recursively walking normal API responses that contain no relevant configuration.
+Objects returned through `Response.json()` use a depth-limited structural scan before the full patcher runs.
 
 ### Event-Driven Architecture
 
-AgebypassX does not use:
+AgebypassX does **not** use:
 
-- Continuous polling
-- Scroll listeners
-- Repeating patch timers
-- Per-tweet processing loops
+- Continuous polling.
+- Scroll listeners.
+- Repeating patch timers.
+- Per-tweet processing loops.
+- Webpack module rewriting.
 
 Patching occurs only when one of the hooked data paths is triggered.
 
@@ -208,11 +370,19 @@ Patching occurs only when one of the hooked data paths is triggered.
 
 ## 🔁 SPA Navigation Support
 
-X is a Single Page Application, meaning large parts of the application can be replaced without a traditional page reload.
+X is a Single Page Application.
 
-AgebypassX uses a new `WeakSet` for every patch operation.
+Large parts of the application can change without a traditional page reload.
 
-This provides cycle protection during a single recursive traversal while still allowing the same state object to be patched again later if X repopulates or modifies it after SPA navigation.
+AgebypassX creates a new:
+
+```js
+WeakSet
+```
+
+for every patch operation.
+
+This gives cycle protection during one traversal while still allowing the same state object to be patched again later if X repopulates or modifies it.
 
 ---
 
@@ -220,42 +390,60 @@ This provides cycle protection during a single recursive traversal while still a
 
 AgebypassX wraps several native JavaScript functions.
 
-To reduce compatibility problems, the replacement functions preserve the original function's:
+To reduce compatibility problems, replacement functions preserve the original function's:
 
-- `.name`
-- `.length`
+```text
+.name
+.length
+```
 
-For example, the wrapped `JSON.parse` continues to identify itself as:
+For example:
 
 ```js
+JSON.parse.name
+```
+
+continues to behave like:
+
+```text
 parse
 ```
 
-and the wrapped `Object.assign` continues to identify itself as:
+and:
 
 ```js
+Object.assign.name
+```
+
+continues to behave like:
+
+```text
 assign
 ```
 
-This helps prevent simple feature-detection checks from treating the functions differently from their native counterparts.
+AgebypassX intentionally does not currently add more aggressive anti-detection or `Function.prototype.toString` spoofing.
+
+There is no evidence that this is required for current functionality, and avoiding unnecessary interception keeps the implementation simpler and more maintainable.
 
 ---
 
 ## 🟢 Status Indicator
 
-AgebypassX displays a small status indicator in the top-right corner of the page.
+AgebypassX displays a small status indicator in the top-right corner.
 
 ### Green Dot
 
 🟢 **ACTIVE**
 
-The script loaded and no hook installation or patching error has been detected.
+The current interception and traversal system is operating without a detected traversal/hook error.
+
+A successful later gated patch can restore the indicator to green after a transient error.
 
 ### Red Dot
 
 🔴 **ERROR**
 
-At least one hook or patch operation encountered an error.
+A hook installation or recursive traversal operation encountered an error.
 
 Check the browser console for messages beginning with:
 
@@ -263,20 +451,56 @@ Check the browser console for messages beginning with:
 [Nox]
 ```
 
+### Important
+
+The dot represents **hook/traversal health**.
+
+Individual feature writes which fail or do not stick are tracked separately in diagnostics and do not automatically turn the dot red.
+
+This distinction allows the script to report:
+
+```text
+Hooks operational
+```
+
+while separately showing:
+
+```text
+Specific feature write failed
+```
+
 ---
 
-## 🖱️ Status Popup
+## 📊 Diagnostics
 
-Click the indicator dot to display the current script status.
+Click the green/red indicator dot to print AgebypassX diagnostics to the browser console.
 
-The popup shows:
+The diagnostics include:
 
-- AgebypassX version
-- Current ACTIVE / ERROR state
-- Installed hooks
-- Indicator hotkey
+```text
+Current ACTIVE / ERROR status
+Total historical hook/traversal errors
+Gate-hit counters
+Feature flags found
+Feature flags successfully changed
+Feature processing/write failures
+Birthdate statistics
+Potential related/unknown keys
+Recent errors
+```
 
-Current hooks:
+### Gate Counters
+
+AgebypassX tracks how many relevant patch attempts came from:
+
+```text
+state
+assign
+parse
+json
+```
+
+These correspond to:
 
 ```text
 __INITIAL_STATE__
@@ -284,6 +508,214 @@ Object.assign
 JSON.parse
 Response.json
 ```
+
+This helps identify which interception paths are actually being used by the current X frontend.
+
+---
+
+## 🎯 Feature Diagnostics
+
+Three counters are tracked for every known target flag.
+
+### `found`
+
+How many times the feature was encountered.
+
+### `changed`
+
+How many times its value needed changing and the new value was successfully verified after assignment.
+
+### `writeFailed`
+
+How many times the feature could not be completely processed or written.
+
+This can include:
+
+- Property reads which throw.
+- Assignment failures.
+- Non-writable properties.
+- Read-back mismatches.
+- Setters which discard the requested value.
+
+### Reading the Counters
+
+```text
+found > 0
+changed > 0
+writeFailed = 0
+```
+
+Means:
+
+```text
+Working normally.
+```
+
+---
+
+```text
+found > 0
+changed = 0
+writeFailed = 0
+```
+
+Means:
+
+```text
+The flag was found but already had the desired value.
+```
+
+---
+
+```text
+found > 0
+writeFailed > 0
+```
+
+Means:
+
+```text
+The flag exists, but one or more processing/write attempts did not complete successfully.
+```
+
+---
+
+```text
+found = 0
+```
+
+Means:
+
+```text
+The flag was not encountered during this session.
+```
+
+This is a **warning signal, not proof of removal**.
+
+Possible explanations include:
+
+- X renamed the feature.
+- The feature is region-specific.
+- The account is not part of the relevant experiment.
+- The endpoint containing the feature was never loaded.
+- X removed the feature.
+- X moved the configuration elsewhere.
+
+---
+
+## 🎂 Birthdate Diagnostics
+
+Birthdate handling has its own counters:
+
+```text
+seen
+changed
+failed
+```
+
+### `seen`
+
+Number of compatible birthdate objects encountered.
+
+### `changed`
+
+Number of individual birthdate fields successfully changed and verified.
+
+### `failed`
+
+Number of individual birthdate field writes which threw or failed read-back verification.
+
+---
+
+## 🔎 Related-Flag Discovery
+
+AgebypassX also includes a lightweight diagnostic scanner which looks for potentially related keys containing terms such as:
+
+```text
+age
+birth
+minor
+sensitive
+blur
+restrict
+verif
+interstitial
+```
+
+Potential matches are logged once per session.
+
+These keys are displayed as:
+
+```text
+related keys seen near known structures (NOT verified flags)
+```
+
+### Limitation
+
+This is **not** a complete automatic feature-renaming detector.
+
+The scanner only runs while traversing state that was already reached through one of AgebypassX's known gates.
+
+If X completely renames both a feature and the surrounding structure, the scanner may never encounter it.
+
+The `found = 0` counters remain an important signal when investigating possible frontend changes.
+
+---
+
+## 🖱️ Diagnostics Example
+
+Click the status dot and open DevTools Console.
+
+You may see something similar to:
+
+```text
+[Nox] diagnostics v2.4.0
+
+status: ACTIVE | total errors: 0
+
+gate hits:
+{
+    state: 1,
+    assign: 4,
+    parse: 2,
+    json: 7
+}
+
+flags found:
+{
+    rweb_age_assurance_flow_enabled: 2,
+    age_verification_gate_enabled: 0,
+    sensitive_tweet_warnings_enabled: 3,
+    sensitive_media_settings_enabled: 3,
+    grok_settings_age_restriction_enabled: 1,
+    rweb_mvr_blurred_media_interstitial_enabled: 0
+}
+
+flags changed:
+{
+    ...
+}
+
+flag process/write failures:
+{
+    ...
+}
+
+birthdate:
+{
+    seen: 2,
+    changed: 3,
+    failed: 0
+}
+```
+
+Actual values depend on:
+
+- Account configuration.
+- Region.
+- Experiments.
+- Which X pages were visited.
+- Which API responses were loaded.
 
 ---
 
@@ -303,7 +735,7 @@ The preference is stored locally using:
 localStorage
 ```
 
-and remains applied across page reloads.
+and persists across page reloads.
 
 No external server receives this setting.
 
@@ -317,13 +749,19 @@ Because the userscript runs at:
 document-start
 ```
 
-the page DOM may not yet exist when the script starts.
+the page DOM may not yet exist when execution begins.
 
-The indicator therefore waits for the document root before mounting.
+The indicator waits until:
 
-A `MutationObserver` also watches for cases where X replaces or removes the indicator during page updates.
+```js
+document.documentElement
+```
 
-If the indicator disappears, AgebypassX automatically mounts it again.
+is available before mounting.
+
+A `MutationObserver` watches the document root for removal of the indicator.
+
+If the dot disappears, AgebypassX mounts it again.
 
 ---
 
@@ -331,7 +769,7 @@ If the indicator disappears, AgebypassX automatically mounts it again.
 
 ### No Indicator Appears
 
-Try the following:
+Try:
 
 - Press **Alt + .** in case the indicator was previously hidden.
 - Confirm Tampermonkey is enabled.
@@ -361,57 +799,72 @@ Search for:
 [Nox]
 ```
 
-You should normally see:
+You should normally see messages similar to:
 
 ```text
-[Nox] Loaded
-[Nox] Ready
+[Nox] v2.4.0 loaded
+[Nox] ready — click the dot for diagnostics
 ```
 
-If there are no AgebypassX messages at all, the userscript is probably not executing.
+If there are no AgebypassX messages at all, the userscript may not be executing.
 
-Check your userscript manager and site permissions.
+Check the userscript manager and site permissions.
 
 ---
 
 ### Red Indicator
 
-A red indicator means an exception occurred while installing or executing one of the hooks.
+A red indicator means the hook/traversal system encountered an error.
 
-Check the browser console for messages such as:
+Possible console messages include:
 
 ```text
+[Nox] Existing state capture failed
 [Nox] __INITIAL_STATE__ hook failed
+[Nox] State patch failed
 [Nox] Object.assign patch failed
 [Nox] JSON.parse patch failed
 [Nox] Response.json hook failed
+[Nox] walk failed
 ```
 
-Include those messages when opening a bug report.
+Click the dot to print the full recent-error diagnostics.
+
+Include relevant messages when opening a bug report.
 
 ---
 
 ### Green Indicator but Behaviour Has Not Changed
 
-A green indicator means the hooks loaded without throwing an error.
+A green indicator does **not** guarantee that every target flag still exists or that X still relies on client-side enforcement.
 
-It does **not** guarantee that X is still using the same feature names or application structures.
+Click the indicator and inspect:
+
+```text
+flags found
+flags changed
+flag process/write failures
+birthdate
+gate hits
+```
 
 X may have:
 
 - Renamed a feature flag.
 - Changed its response format.
 - Moved configuration to another state path.
+- Region-gated a feature.
+- Added or changed experiments.
 - Added server-side enforcement.
 - Changed how the frontend consumes feature state.
 
-If this happens, open a GitHub issue with console information and reproduction details.
+The diagnostic counters are designed to make these cases easier to identify.
 
 ---
 
 ## 🌐 Browser Compatibility
 
-AgebypassX has primarily been tested with **Chromium-based browsers**.
+AgebypassX has primarily been tested with Chromium-based browsers.
 
 Examples include:
 
@@ -420,49 +873,57 @@ Examples include:
 - Microsoft Edge
 - Brave
 
-Other browsers or userscript managers may behave differently.
+Tampermonkey and Violentmonkey-compatible environments should generally work, but userscript-manager behaviour can differ between browsers.
+
+The script safely guards its use of:
+
+```js
+GM_info
+```
+
+and falls back to the hardcoded script version if unavailable.
 
 ---
 
 ## 🧪 Debugging
 
-Open the browser developer console and filter messages using:
+Open DevTools and filter for:
 
 ```text
 [Nox]
 ```
 
-Common messages include:
+### Script Startup
 
 ```text
-[Nox] Loaded
+[Nox] v2.4.0 loaded
 ```
 
 The userscript has started executing.
 
 ```text
-[Nox] Ready
+[Nox] ready — click the dot for diagnostics
 ```
 
-All hook installation code has completed.
+Hook installation code has completed.
+
+### Errors
+
+Errors use messages such as:
 
 ```text
-[Nox] Patched __INITIAL_STATE__
+[Nox] JSON.parse patch failed
 ```
 
-An initial application state object was intercepted and passed through the patcher.
+The diagnostics retain up to the most recent:
 
 ```text
-[Nox] Indicator hidden
+20
 ```
 
-or:
+errors.
 
-```text
-[Nox] Indicator visible
-```
-
-The indicator visibility was changed using **Alt + .**.
+Console warning output is rate-limited to avoid excessive spam.
 
 ---
 
@@ -476,17 +937,23 @@ https://github.com/Saganaki22/AgebypassX/issues
 
 Please include:
 
-- Browser name
-- Browser version
-- Userscript manager
-- Userscript manager version
-- AgebypassX version
-- Relevant `[Nox]` console messages
-- Screenshot of the status popup if useful
-- Description of what happened
-- Steps required to reproduce the issue
+- Browser name.
+- Browser version.
+- Userscript manager.
+- Userscript manager version.
+- AgebypassX version.
+- Current dot status.
+- `gate hits` diagnostics.
+- `flags found` diagnostics.
+- `flags changed` diagnostics.
+- `flag process/write failures`.
+- Birthdate diagnostics if relevant.
+- Related-key diagnostics if present.
+- Relevant `[Nox]` errors.
+- Description of what happened.
+- Steps required to reproduce the issue.
 
-Please remove any personal information from screenshots or console output before posting it publicly.
+Please remove personal information from screenshots or console output before posting it publicly.
 
 ---
 
@@ -520,13 +987,147 @@ GitHub:
 
 https://github.com/Saganaki22/AgebypassX
 
-If X changes its frontend architecture or feature configuration, reports containing useful console information can help identify what changed.
+If X changes its frontend architecture or feature configuration, reports containing the new v2.4.0 diagnostic counters can help identify what changed.
 
 ---
 
 # 🔄 Version History
 
-## v2.3.0 — Current
+## v2.4.0 — Current
+
+### 🔢 Type-Preserving Feature Writes
+
+Feature modifications now preserve X's existing representation.
+
+Supported forms include:
+
+```text
+boolean → boolean
+string  → "true" / "false"
+number  → 1 / 0
+```
+
+This improves compatibility with feature-switch structures that use strict type comparisons.
+
+### ✅ Verified Writes
+
+Target-feature assignments are now read back after modification.
+
+The script separately tracks:
+
+```text
+found
+changed
+writeFailed
+```
+
+so diagnostics can distinguish between:
+
+- A feature not being present.
+- A feature already having the desired value.
+- A successful modification.
+- A modification which threw or did not stick.
+
+### 📊 Advanced Diagnostics
+
+Clicking the indicator now prints detailed diagnostics to the browser console.
+
+Diagnostics include:
+
+```text
+Current health
+Historical errors
+Per-hook gate counts
+Per-flag found counts
+Per-flag changed counts
+Per-flag processing/write failures
+Birthdate statistics
+Potential related keys
+Recent errors
+```
+
+Known feature counters are pre-seeded with `0`, making features which were not encountered immediately visible.
+
+### 🎂 Verified Birthdate Patching
+
+Birthdate handling now uses:
+
+- Type-preserving scalar conversion.
+- Verified assignment.
+- Read-back validation.
+
+The script tracks:
+
+```text
+birthdate.seen
+birthdate.changed
+birthdate.failed
+```
+
+### 🧠 Improved Status Model
+
+The indicator now separates:
+
+```text
+Hook/traversal health
+```
+
+from:
+
+```text
+Individual feature-write outcomes
+```
+
+A transient hook/traversal error can recover to green after a genuinely successful gated patch.
+
+Unrelated `JSON.parse`, `Object.assign`, or response activity cannot falsely clear an error state.
+
+### 🔁 Patch Failure Propagation
+
+Recursive traversal now propagates internal traversal failures back to the originating hook.
+
+A hook only reports successful recovery when its gated patch completed without a traversal error.
+
+### 🔎 Related-Key Diagnostics
+
+Added heuristic discovery of potentially related keys containing terms such as:
+
+```text
+age
+birth
+minor
+sensitive
+blur
+restrict
+verif
+interstitial
+```
+
+This helps investigate X frontend changes while clearly distinguishing candidates from verified feature flags.
+
+### 🛡️ Late `__INITIAL_STATE__` Protection
+
+If AgebypassX starts after X has already populated:
+
+```js
+window.__INITIAL_STATE__
+```
+
+the existing value is captured and patched before the accessor is installed.
+
+If capturing the existing property fails, AgebypassX leaves it untouched rather than risking state corruption.
+
+Hooks 2–4 remain operational as fallback interception paths.
+
+### 🧹 Metadata Cleanup
+
+The current implementation is described accurately as application-state and parsed-response interception.
+
+Webpack interception is not used or required by v2.4.0.
+
+---
+
+## v2.3.0
 
 ### ⌨️ Indicator Hotkey
 
@@ -548,7 +1149,7 @@ Deep recursive walks are only performed when potentially relevant feature names 
 
 ### 🔍 Smarter Fetch Inspection
 
-`Response.json()` results now use a lightweight, depth-limited structural scan before the full object patcher runs.
+`Response.json()` results use a lightweight depth-limited structural scan before the full object patcher runs.
 
 This substantially reduces unnecessary traversal of unrelated responses.
 
@@ -568,7 +1169,7 @@ because browser-native fetch response parsing can bypass an overridden `JSON.par
 
 ### 🔁 Re-Patch Support
 
-Cycle detection is now scoped to individual patch operations.
+Cycle detection became scoped to individual patch operations.
 
 State objects can therefore be patched again if X repopulates them after SPA navigation.
 
@@ -576,9 +1177,9 @@ State objects can therefore be patched again if X repopulates them after SPA nav
 
 Improved indicator mounting for `document-start`.
 
-The indicator is also automatically restored if the page removes it.
+The indicator is automatically restored if the page removes it.
 
-### 🎭 Native Function Spoofing
+### 🎭 Native Function Compatibility
 
 Wrapped native functions preserve their original:
 
@@ -591,7 +1192,7 @@ values.
 
 ### 🧩 GraphQL Feature Arrays
 
-Added support for feature structures using:
+Added support for:
 
 ```js
 {
@@ -616,17 +1217,18 @@ JSON.parse
 
 ### 🚦 Status Indicator
 
-Added the green/red status indicator with click-for-status information.
+Added the green/red status indicator.
 
 ### 🛡️ Hardened Patching
 
 Improved protection against:
 
-- Circular object graphs
-- Throwing getters
-- Non-writable properties
-- Unexpected application objects
-- DOM objects and browser globals
+- Circular object graphs.
+- Throwing getters.
+- Non-writable properties.
+- Unexpected application objects.
+- DOM objects.
+- Browser globals.
 
 ---
 
@@ -656,7 +1258,7 @@ Expanded the status indicator and debugging interface.
 
 Added additional console information and debugging tools.
 
-> The architecture introduced in v1.3.0 should not be confused with the current v2.3.0 implementation. Modern releases primarily use application-state and response interception instead of webpack chunk interception.
+> The architecture introduced in v1.3.0 should not be confused with modern AgebypassX releases. v2.x now uses application-state and response interception instead of webpack chunk interception.
 
 ---
 
@@ -687,9 +1289,10 @@ Added additional console information and debugging tools.
 
 ## ⚠️ Disclaimer
 
-AgebypassX is an independent open-source project and is not affiliated with, endorsed by, or associated with X Corp., Twitter, or Tampermonkey.
+AgebypassX is an independent open-source project and is not affiliated with, endorsed by, or associated with X Corp., Twitter, Tampermonkey, or Violentmonkey.
 
-The project modifies client-side application state only. X may change its frontend or introduce additional server-side enforcement at any time, which may cause some or all functionality to stop working.
+The project modifies client-side application state only.
+
+X may change its frontend, feature flags, experiments, response structures, or introduce additional server-side enforcement at any time, which may cause some or all functionality to stop working.
 
 Use the software at your own discretion and comply with the laws, platform rules, and age requirements applicable to you.
-````
